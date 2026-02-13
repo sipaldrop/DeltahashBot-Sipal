@@ -1,0 +1,18 @@
+{
+  "name": "sipal-deltahash",
+  "version": "1.0.0",
+  "description": "Sipal Airdrop Community Bot — DeltaHash Mining Automation",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "Sipal Airdrop",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.9",
+    "chalk": "^4.1.2",
+    "cli-table3": "^0.6.5",
+    "https-proxy-agent": "^7.0.6",
+    "socks-proxy-agent": "^8.0.5"
+  }
+}

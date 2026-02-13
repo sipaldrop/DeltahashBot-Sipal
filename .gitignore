@@ -1,0 +1,9 @@
+node_modules/
+.env
+accounts.json
+wallet.json
+tokens.json
+device_fingerprints.json
+database.json
+session/
+*.log
