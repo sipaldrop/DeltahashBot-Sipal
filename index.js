@@ -19,6 +19,7 @@ const BASE_URL = 'https://portal.deltahash.ai';
 const API = {
   AUTH_ME: `${BASE_URL}/api/auth/me`,
   DEVICES_CONNECT: `${BASE_URL}/api/devices/connect`,
+  DEVICES_REGISTER: `${BASE_URL}/api/devices/register`,
   MINING_CONNECT: `${BASE_URL}/api/mining/connect`,
   MINING_DISCONNECT: `${BASE_URL}/api/mining/disconnect`,
   MINING_STATUS: `${BASE_URL}/api/mining/status`,
@@ -36,7 +37,7 @@ const DEVICE_RECONNECT_BUFFER_MS = 10 * 1000;     // Reconnect device 10s before
 const MAX_RETRY = 5;
 const BASE_DELAY_MS = 2000;
 const MAX_CONCURRENT_ACCOUNTS = 0;                 // 0 = run ALL accounts, or set limit (e.g., 5)
-const MAX_LOGS = 20;
+const MAX_LOGS = 5;
 const PROXY_HEALTH_WINDOW_MS = 5 * 60 * 1000;     // Track proxy health over 5 minutes
 const PROXY_ROTATE_ON_FAILS = 3;                   // Rotate to next proxy after 3 consecutive failures
 const PROXY_ROTATE_INTERVAL_MS = 30 * 60 * 1000;  // Optional: rotate proxy every 30 min (0 = disabled)
@@ -288,8 +289,8 @@ function printBanner() {
               \\   /
                \\ /
 `) + '\n' +
-  chalk.bold.cyan('    ======SIPAL AIRDROP======\n') +
-  chalk.bold.cyan('  =====SIPAL DELTAHASH V1.0=====\n');
+    chalk.bold.cyan('    ======SIPAL AIRDROP======\n') +
+    chalk.bold.cyan('  =====SIPAL DELTAHASH V1.0=====\n');
 }
 
 // ============================================================
@@ -828,11 +829,24 @@ async function getMiningStatus(client, label) {
   throw new Error('Invalid mining/status response');
 }
 
-async function connectDevice(client, fp, label) {
+// ── Generate realistic UUID v4 (like browser crypto.randomUUID()) ──
+function generateDeviceId() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (crypto.randomBytes(1)[0] / 255) * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
+// ============================================================
+// QUICK DEVICE CONNECT (1 attempt only — no pointless retries on 500)
+// ============================================================
+async function quickDeviceConnect(client, fp, label) {
   logger(label, 'Connecting device to mining network...', 'info');
   await microPause();
   const deviceData = buildDeviceData(fp);
-  const data = await smartRequest(client, 'post', API.DEVICES_CONNECT, { deviceData }, label);
+  // Only 1 retry — if server 500s, we know it's unregistered and move on fast
+  const data = await smartRequest(client, 'post', API.DEVICES_CONNECT, { deviceData }, label, 1);
   if (data?.alreadyConnected) {
     logger(label, 'Device already registered on server — Acknowledged', 'success');
     return data;
@@ -843,6 +857,138 @@ async function connectDevice(client, fp, label) {
   }
   logger(label, `Device connect response: ${JSON.stringify(data).slice(0, 200)}`, 'warn');
   return data;
+}
+
+// ============================================================
+// AUTO-REGISTER DEVICE (for accounts that never mined on web)
+// ============================================================
+// The error "invalid input syntax for type json" (HTTP 500) is a PostgreSQL
+// error: the server's devices table has no record for this user, and the
+// server-side code doesn't handle null gracefully.
+//
+// Strategy: Try EVERY possible registration method (1 attempt each, no
+// retries) and then ALWAYS proceed to mining regardless of result.
+// The mining/connect + heartbeat endpoints may auto-create the device record.
+// ============================================================
+
+async function tryRegisterDevice(client, fp, label) {
+  const deviceId = generateDeviceId();
+  const deviceData = buildDeviceData(fp);
+
+  logger(label, `⚙️ Device not registered — Auto-registering (ID: ${deviceId.slice(0, 8)}...)`, 'warn');
+
+  // ── Attempt 1: POST /api/devices/connect with deviceId included ──
+  // Some servers accept this as "create new device" when deviceId is in payload
+  await sleep(1000 + Math.random() * 1500);
+  try {
+    const res = await client.post(API.DEVICES_CONNECT, { deviceId, deviceData });
+    const d = res.data;
+    if (d?.success || d?.user || d?.alreadyConnected) {
+      logger(label, `✅ Device registered via /devices/connect + deviceId`, 'success');
+      return { success: true, deviceId, user: d.user };
+    }
+    logger(label, `Connect+ID response: ${JSON.stringify(d).slice(0, 120)}`, 'info');
+  } catch (e) {
+    if (e.response?.status === 401 || e.response?.status === 403) throw new Error('AUTH_EXPIRED:' + e.response.status);
+    const msg = e.response?.data?.message || e.message;
+    logger(label, `Connect+ID: ${e.response?.status || 'err'} ${msg?.slice(0, 80)}`, 'info');
+  }
+
+  // ── Attempt 2: POST /api/devices/connect with flat deviceData (no wrapper) ──
+  // Maybe the server expects deviceData at root level, not nested
+  await sleep(800 + Math.random() * 1200);
+  try {
+    const res = await client.post(API.DEVICES_CONNECT, deviceData);
+    const d = res.data;
+    if (d?.success || d?.user || d?.alreadyConnected) {
+      logger(label, `✅ Device registered via /devices/connect (flat payload)`, 'success');
+      return { success: true, deviceId, user: d.user };
+    }
+    logger(label, `Connect-flat response: ${JSON.stringify(d).slice(0, 120)}`, 'info');
+  } catch (e) {
+    if (e.response?.status === 401 || e.response?.status === 403) throw new Error('AUTH_EXPIRED:' + e.response.status);
+    const msg = e.response?.data?.message || e.message;
+    logger(label, `Connect-flat: ${e.response?.status || 'err'} ${msg?.slice(0, 80)}`, 'info');
+  }
+
+  // ── Attempt 3: POST /api/devices/register (dedicated endpoint, if exists) ──
+  await sleep(800 + Math.random() * 1200);
+  try {
+    const regPayload = {
+      deviceId,
+      deviceData,
+      deviceName: `${fp.platform} Desktop`,
+      deviceType: fp.deviceType,
+    };
+    const res = await client.post(API.DEVICES_REGISTER, regPayload);
+    const d = res.data;
+    if (d?.success || d?.user || d?.device) {
+      logger(label, `✅ Device registered via /devices/register`, 'success');
+      return { success: true, deviceId, user: d.user };
+    }
+    logger(label, `Register response: ${JSON.stringify(d).slice(0, 120)}`, 'info');
+  } catch (e) {
+    if (e.response?.status === 401 || e.response?.status === 403) throw new Error('AUTH_EXPIRED:' + e.response.status);
+    // 404/405 = endpoint doesn't exist — expected
+    if (e.response?.status !== 404 && e.response?.status !== 405) {
+      const msg = e.response?.data?.message || e.message;
+      logger(label, `Register: ${e.response?.status || 'err'} ${msg?.slice(0, 80)}`, 'info');
+    }
+  }
+
+  // ── Attempt 4: POST /api/mining/connect FIRST (this may auto-create device) ──
+  // Key insight: the browser's "Start Mining" button likely calls mining/connect
+  // which may internally create the device record on the server side
+  await sleep(800 + Math.random() * 1200);
+  try {
+    const res = await client.post(API.MINING_CONNECT, {});
+    const d = res.data;
+    if (d) {
+      logger(label, `✅ Mining session started (may have auto-registered device)`, 'success');
+      // Now try connecting device again — server might have created the record
+      await sleep(1500 + Math.random() * 1000);
+      try {
+        const retry = await client.post(API.DEVICES_CONNECT, { deviceData });
+        if (retry.data?.success || retry.data?.user || retry.data?.alreadyConnected) {
+          logger(label, `✅ Device connect succeeded after mining/connect`, 'success');
+          return { success: true, deviceId, user: retry.data.user, miningStarted: true };
+        }
+      } catch (retryErr) {
+        // Still fails — that's OK, mining is already started
+        logger(label, `Device connect still fails after mining/connect — Mining may still work`, 'info');
+      }
+      return { success: true, deviceId, miningStarted: true };
+    }
+  } catch (e) {
+    if (e.response?.status === 401 || e.response?.status === 403) throw new Error('AUTH_EXPIRED:' + e.response.status);
+    const msg = e.response?.data?.message || e.message;
+    logger(label, `Mining connect attempt: ${e.response?.status || 'err'} ${msg?.slice(0, 80)}`, 'info');
+  }
+
+  // ── Attempt 5: POST /api/mining/heartbeat directly (ultimate fallback) ──
+  // Some servers auto-register the device on the first heartbeat
+  await sleep(800 + Math.random() * 1200);
+  try {
+    const res = await client.post(API.MINING_HEARTBEAT, undefined, {
+      headers: { 'content-type': undefined }
+    });
+    const d = res.data;
+    if (d?.success) {
+      logger(label, `✅ First heartbeat accepted — Device auto-registered by server`, 'success');
+      return { success: true, deviceId, miningStarted: true, heartbeatOk: true, heartbeatData: d };
+    }
+    if (d?.disconnected) {
+      logger(label, `Heartbeat says disconnected — Will keep trying via mining loop`, 'info');
+    }
+  } catch (e) {
+    if (e.response?.status === 401 || e.response?.status === 403) throw new Error('AUTH_EXPIRED:' + e.response.status);
+    const msg = e.response?.data?.message || e.message;
+    logger(label, `Direct heartbeat: ${e.response?.status || 'err'} ${msg?.slice(0, 80)}`, 'info');
+  }
+
+  // All attempts exhausted — proceed to mining loop anyway
+  logger(label, `⚠️ All registration attempts exhausted — Proceeding to mining loop (will retry periodically)`, 'warn');
+  return { success: false, deviceId };
 }
 
 async function startMining(client, label) {
@@ -927,29 +1073,79 @@ async function initialSetup(client, fp, account, index) {
 
   await sleep(800 + Math.random() * 1500);
 
-  // 3. Connect device (ALWAYS attempt — never assume connected)
-  const connectResult = await connectDevice(client, fp, label);
-  if (connectResult?.user) {
-    accState.deviceId = connectResult.user.deviceId;
-    accState.balance = connectResult.user.balance;
-  } else if (connectResult?.alreadyConnected) {
-    accState.deviceId = accState.deviceId || 'Connected';
+  // 3. Connect device — FAST (1 attempt, no useless retries on 500)
+  let deviceConnected = false;
+  let miningAlreadyStarted = false;
+
+  try {
+    const connectResult = await quickDeviceConnect(client, fp, label);
+    if (connectResult?.user) {
+      accState.deviceId = connectResult.user.deviceId;
+      accState.balance = connectResult.user.balance;
+      deviceConnected = true;
+    } else if (connectResult?.alreadyConnected) {
+      accState.deviceId = accState.deviceId || 'Connected';
+      deviceConnected = true;
+    }
+  } catch (connectErr) {
+    if (connectErr.message?.startsWith('AUTH_EXPIRED')) throw connectErr;
+
+    // ── UNREGISTERED DEVICE → AUTO-REGISTER ──
+    const errStatus = connectErr.response?.status;
+    const errMsg = connectErr.response?.data?.message || connectErr.message || '';
+
+    logger(label, `Device connect failed (${errStatus || 'err'}): ${errMsg.slice(0, 80)} — Auto-registering...`, 'warn');
+
+    const regResult = await tryRegisterDevice(client, fp, label);
+
+    if (regResult.success) {
+      accState.deviceId = regResult.deviceId || 'Registered';
+      if (regResult.user) accState.balance = regResult.user.balance || accState.balance;
+      deviceConnected = true;
+      miningAlreadyStarted = !!regResult.miningStarted;
+
+      // If registration included heartbeat data, update stats
+      if (regResult.heartbeatOk && regResult.heartbeatData) {
+        const hbd = regResult.heartbeatData;
+        accState.balance = hbd.newBalance || accState.balance;
+        accState.totalEarned = (accState.totalEarned || 0) + (hbd.tokensEarned || 0);
+        accState.epoch = hbd.epochNumber;
+      }
+    } else {
+      accState.deviceId = regResult.deviceId || 'Pending';
+      logger(label, '⚠️ Device registration incomplete — Mining may still work', 'warn');
+    }
   }
   renderDashboard();
 
   await sleep(1000 + Math.random() * 2000);
 
   // 4. Initial mining status check
-  const miningData = await getMiningStatus(client, label);
-  accState.balance = miningData.balance || miningData.userBalance;
-  accState.speed = miningData.miningSpeed;
-  accState.epoch = miningData.epoch?.number;
-  accState.baseRate = miningData.baseRate;
+  let miningData;
+  try {
+    miningData = await getMiningStatus(client, label);
+    accState.balance = miningData.balance || miningData.userBalance || accState.balance;
+    accState.speed = miningData.miningSpeed;
+    accState.epoch = miningData.epoch?.number;
+    accState.baseRate = miningData.baseRate;
+  } catch (statusErr) {
+    if (statusErr.message?.startsWith('AUTH_EXPIRED')) throw statusErr;
+    logger(label, `Mining status check failed: ${statusErr.message} — Continuing...`, 'warn');
+    miningData = { epoch: {}, balance: accState.balance, miningSpeed: null, baseRate: null };
+  }
 
-  // 5. Start mining session (POST /api/mining/connect with {})
-  // This is the CRITICAL step the browser does before heartbeats work!
-  await sleep(500 + Math.random() * 1000);
-  await startMining(client, label);
+  // 5. Start mining session (skip if already started during registration)
+  if (!miningAlreadyStarted) {
+    await sleep(500 + Math.random() * 1000);
+    try {
+      await startMining(client, label);
+    } catch (mineErr) {
+      if (mineErr.message?.startsWith('AUTH_EXPIRED')) throw mineErr;
+      logger(label, `Mining connect failed: ${mineErr.message} — Will retry on first heartbeat`, 'warn');
+    }
+  } else {
+    logger(label, 'Mining session already started during registration — Skipping', 'info');
+  }
 
   // 6. Send first mining heartbeat to verify mining is active
   await sleep(1000 + Math.random() * 1000);
@@ -957,13 +1153,18 @@ async function initialSetup(client, fp, account, index) {
     const hbResult = await sendMiningHeartbeat(client, label);
     if (hbResult?.disconnected) {
       logger(label, 'First heartbeat says disconnected — retrying mining/connect...', 'warn');
-      await startMining(client, label);
-      await sleep(2000);
-      const hb2 = await sendMiningHeartbeat(client, label);
-      if (hb2?.success) {
-        accState.balance = hb2.newBalance;
-        accState.totalEarned = (accState.totalEarned || 0) + (hb2.tokensEarned || 0);
-        logger(label, `Heartbeat OK after reconnect — Balance: ${hb2.newBalance} $DTH`, 'success');
+      try {
+        await startMining(client, label);
+        await sleep(2000);
+        const hb2 = await sendMiningHeartbeat(client, label);
+        if (hb2?.success) {
+          accState.balance = hb2.newBalance;
+          accState.totalEarned = (accState.totalEarned || 0) + (hb2.tokensEarned || 0);
+          logger(label, `Heartbeat OK after reconnect — Balance: ${hb2.newBalance} $DTH`, 'success');
+        }
+      } catch (reconnErr) {
+        if (reconnErr.message?.startsWith('AUTH_EXPIRED')) throw reconnErr;
+        logger(label, `Reconnect attempt failed: ${reconnErr.message}`, 'warn');
       }
     } else if (hbResult?.success) {
       accState.balance = hbResult.newBalance;
@@ -971,7 +1172,8 @@ async function initialSetup(client, fp, account, index) {
       logger(label, `First heartbeat sent — Earned: +${hbResult.tokensEarned} $DTH | New Balance: ${hbResult.newBalance} $DTH`, 'success');
     }
   } catch (e) {
-    logger(label, `First heartbeat failed: ${e.message}`, 'warn');
+    if (e.message?.startsWith('AUTH_EXPIRED')) throw e;
+    logger(label, `First heartbeat failed: ${e.message} — Will retry in heartbeat loop`, 'warn');
   }
 
   // Save session data
